@@ -88,6 +88,10 @@ type pendingCreation struct {
 	err     error
 }
 
+// defaultSessionCreationTimeout bounds a shared creation whose first caller had no deadline, so a
+// peer that never completes the handshake cannot pin the creation (and its waiters) indefinitely.
+const defaultSessionCreationTimeout = 30 * time.Second
+
 func NewClient(options ClientOptions) (*Client, error) {
 	factory, err := newPaddingFactory(DefaultPaddingScheme)
 	if err != nil {
@@ -237,9 +241,22 @@ func (c *Client) sessionForCreation(ctx context.Context) (*session, error) {
 func (c *Client) creationContext(callerCtx context.Context) (context.Context, context.CancelFunc) {
 	detached := context.WithoutCancel(callerCtx)
 	createCtx, cancel := context.WithCancel(detached)
+	// The caller's DEADLINE is kept: it is the bound on how long anyone should wait for this
+	// creation, and the caller that started it is the best available estimate. Its CANCELLATION is
+	// not kept, because one caller giving up must not abort a dial other waiters still need. A
+	// caller without a deadline gets a hard bound so a silent peer cannot pin the creation forever
+	// (the pre-coalescing code inherited the caller's cancellation for this, which no longer
+	// reaches the creation).
+	var boundCancel context.CancelFunc
+	if deadline, hasDeadline := callerCtx.Deadline(); hasDeadline {
+		createCtx, boundCancel = context.WithDeadline(createCtx, deadline)
+	} else {
+		createCtx, boundCancel = context.WithTimeout(createCtx, defaultSessionCreationTimeout)
+	}
 	stop := context.AfterFunc(c.creationCtx, cancel)
 	return createCtx, func() {
 		stop()
+		boundCancel()
 		cancel()
 	}
 }
