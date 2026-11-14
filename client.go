@@ -67,6 +67,25 @@ type Client struct {
 	sessions     map[*session]struct{}
 	idleSessions list.List[*session]
 	idleTimer    *time.Timer
+
+	// creationCtx is the lifetime of a SHARED creation. A dial that starts one must not be
+	// cancellable by the single caller that happened to arrive first, because every other waiter
+	// owns the result too; Close cancels it with its cause instead.
+	creationCtx    context.Context
+	cancelCreation context.CancelCauseFunc
+	// pending is the session creation currently in flight, or nil. It is set and cleared under
+	// access; the offer goroutine owns the result and publishes it under the same lock.
+	pending *pendingCreation
+	// creationWaiterHook is a test seam: called after a caller attaches to the pending creation and
+	// before it waits. Nil in production and costs one branch in that path.
+	creationWaiterHook func()
+}
+
+// pendingCreation is one shared session creation and its result.
+type pendingCreation struct {
+	done    chan struct{}
+	session *session
+	err     error
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -95,6 +114,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if client.idleTimeout <= minimumIdleSessionInterval {
 		client.idleTimeout = defaultIdleSessionTimeout
 	}
+	client.creationCtx, client.cancelCreation = context.WithCancelCause(context.Background())
 	client.padding.Store(factory)
 	return client, nil
 }
@@ -121,7 +141,7 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		idle.Close()
 	}
-	created, err := c.createSession(ctx)
+	created, err := c.sessionForCreation(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +154,94 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 		created.keepOnce.Store(true)
 	}
 	return opened, nil
+}
+
+// sessionForCreation returns a session a new stream can be opened on, sharing one in-flight
+// creation with every other caller that arrives while it runs.
+//
+// # Why this exists
+//
+// takeIdleSession only returns sessions that have already completed a stream: a session re-enters
+// the idle list when one of its streams finishes (see releaseSession). A burst of first flows
+// therefore finds the list empty in every goroutine, and each one starts its own connect, TLS
+// handshake and first write. The admission gate bounds how many of those run at once, but not how
+// many are performed: 200 concurrent flows still perform up to 200 handshakes, paced 32 at a time.
+// Coalescing turns that into one creation plus 199 stream opens on the result.
+//
+// # The rules it keeps
+//
+//   - A caller still tries the idle list first; a coalesced creation is only for demand that found
+//     no reusable session.
+//   - The creation runs under the client's lifetime plus the FIRST caller's values (traffic class,
+//     held admission permit), never under that caller's cancellation: one caller leaving must not
+//     tear down a dial the waiters still need.
+//   - Each waiter keeps its own cancellation while waiting.
+//   - A failed creation fails every waiter with the same error and is not retried here; the next
+//     demand starts a new one. A success whose session closed before a waiter used it gets one more
+//     attempt, because the result was discarded, not refused.
+func (c *Client) sessionForCreation(ctx context.Context) (*session, error) {
+	for attempt := 0; ; attempt++ {
+		c.access.Lock()
+		if c.closed {
+			c.access.Unlock()
+			return nil, net.ErrClosed
+		}
+		pending := c.pending
+		if pending == nil {
+			pending = &pendingCreation{done: make(chan struct{})}
+			c.pending = pending
+			c.access.Unlock()
+
+			createCtx, cancelCreate := c.creationContext(ctx)
+			created, err := c.createSession(createCtx)
+			cancelCreate()
+
+			c.access.Lock()
+			pending.session = created
+			pending.err = err
+			if c.pending == pending {
+				c.pending = nil
+			}
+			c.access.Unlock()
+			close(pending.done)
+			return created, err
+		}
+		c.access.Unlock()
+
+		if c.creationWaiterHook != nil {
+			c.creationWaiterHook()
+		}
+		select {
+		case <-pending.done:
+			if pending.err != nil {
+				return nil, pending.err
+			}
+			if pending.session != nil && !pending.session.IsClosed() {
+				return pending.session, nil
+			}
+			if attempt >= 1 {
+				return nil, net.ErrClosed
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// creationContext builds the context one shared creation runs under.
+//
+// Values come from the caller that started the creation (the traffic class and an already-held
+// admission permit are properties of the work being created); cancellation comes from the client,
+// so a departing caller cannot abort a dial other callers are waiting for. The registration is
+// removed when the creation returns.
+func (c *Client) creationContext(callerCtx context.Context) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(callerCtx)
+	createCtx, cancel := context.WithCancel(detached)
+	stop := context.AfterFunc(c.creationCtx, cancel)
+	return createCtx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // createSession builds a new session. Admission is asked HERE, after the idle-reuse attempt in
@@ -354,6 +462,7 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	cancelCreation := c.cancelCreation
 	if c.idleTimer != nil {
 		c.idleTimer.Stop()
 		c.idleTimer = nil
@@ -366,6 +475,9 @@ func (c *Client) Close() error {
 	clear(c.sessions)
 	c.idleSessions.Init()
 	c.access.Unlock()
+	if cancelCreation != nil {
+		cancelCreation(net.ErrClosed)
+	}
 	var err error
 	for _, closing := range sessions {
 		err = E.Errors(err, closing.Close())
