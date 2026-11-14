@@ -79,6 +79,10 @@ type Client struct {
 	// creationWaiterHook is a test seam: called after a caller attaches to the pending creation and
 	// before it waits. Nil in production and costs one branch in that path.
 	creationWaiterHook func()
+	// pendingWaiters is the number of callers currently attached to the in-flight creation. It is a
+	// diagnostic gauge: "one creation with 199 waiters" and "200 creations" are indistinguishable
+	// from the accept count alone under scheduler skew, and this is what tells them apart.
+	pendingWaiters atomic.Int32
 }
 
 // pendingCreation is one shared session creation and its result.
@@ -212,24 +216,45 @@ func (c *Client) sessionForCreation(ctx context.Context) (*session, error) {
 		}
 		c.access.Unlock()
 
+		c.pendingWaiters.Add(1)
 		if c.creationWaiterHook != nil {
 			c.creationWaiterHook()
 		}
+		var (
+			shared  *session
+			waitErr error
+		)
 		select {
 		case <-pending.done:
 			if pending.err != nil {
-				return nil, pending.err
-			}
-			if pending.session != nil && !pending.session.IsClosed() {
-				return pending.session, nil
-			}
-			if attempt >= 1 {
-				return nil, net.ErrClosed
+				waitErr = pending.err
+			} else if pending.session != nil && !pending.session.IsClosed() {
+				shared = pending.session
 			}
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			waitErr = ctx.Err()
+		}
+		c.pendingWaiters.Add(-1)
+		if shared != nil {
+			return shared, nil
+		}
+		if waitErr != nil {
+			return nil, waitErr
+		}
+		if attempt >= 1 {
+			return nil, net.ErrClosed
 		}
 	}
+}
+
+// PendingCreationWaiters reports how many callers are currently waiting on the in-flight session
+// creation (0 when none is pending). A caller that is itself creating the session is not counted.
+//
+// This is the gauge that distinguishes coalescing from pacing: one creation with N-1 waiters is the
+// fixed shape, N creations is the old one, and the accept count alone cannot tell them apart when a
+// goroutine is scheduled after the creation completed.
+func (c *Client) PendingCreationWaiters() int {
+	return int(c.pendingWaiters.Load())
 }
 
 // creationContext builds the context one shared creation runs under.
