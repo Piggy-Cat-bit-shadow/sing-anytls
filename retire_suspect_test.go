@@ -80,6 +80,7 @@ func dialTwoCoalescedFlows(t *testing.T, client *Client, dialer *blockingDialer)
 // must create a new session instead of multiplexing onto the one that predates it, and the stream the
 // old session already carries must survive the boundary.
 func TestRetireSuspectDrainsASessionWithALiveStream(t *testing.T) {
+	t.Parallel()
 	dialer := newBlockingDialer(true)
 	client := newCoalescingClient(t, dialer.Dial, nil)
 
@@ -115,6 +116,7 @@ func TestRetireSuspectDrainsASessionWithALiveStream(t *testing.T) {
 // TestRetireSuspectClosesASessionNobodyUses pins the other half of the action: a session with no
 // stream is not worth draining, and a boundary that leaves it listed would hand it to the next flow.
 func TestRetireSuspectClosesASessionNobodyUses(t *testing.T) {
+	t.Parallel()
 	dialer := newBlockingDialer(true)
 	client := newCoalescingClient(t, dialer.Dial, nil)
 
@@ -136,6 +138,7 @@ func TestRetireSuspectClosesASessionNobodyUses(t *testing.T) {
 // TestRetireSuspectOnAnEmptyPoolIsInert is the positive control: the boundary must not do anything
 // when there is nothing to retire, and the next flow must behave exactly as before.
 func TestRetireSuspectOnAnEmptyPoolIsInert(t *testing.T) {
+	t.Parallel()
 	dialer := newBlockingDialer(false)
 	client := newCoalescingClient(t, dialer.Dial, nil)
 
