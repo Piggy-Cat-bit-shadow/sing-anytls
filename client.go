@@ -382,6 +382,23 @@ func (c *Client) releaseSession(released *session) {
 		return
 	}
 	keepOnce := released.keepOnce.Swap(false)
+	if released.retired {
+		// A reuse boundary retired this session while it carried this stream. It never takes new work
+		// again, so it is never listed for reuse again either: the stream that just finished may have
+		// been its last one, and then the session closes here.
+		if released.element != nil {
+			c.idleSessions.Remove(released.element)
+			released.element = nil
+		}
+		if !released.hasStreams() {
+			delete(c.sessions, released)
+			c.access.Unlock()
+			released.Close()
+			return
+		}
+		c.access.Unlock()
+		return
+	}
 	if !released.hasStreams() && c.closeIdle.Load() && !keepOnce {
 		if released.element != nil {
 			c.idleSessions.Remove(released.element)
@@ -430,6 +447,54 @@ func (c *Client) CloseIdleConnections() {
 	c.access.Unlock()
 	for _, idle := range closing {
 		idle.Close()
+	}
+}
+
+// RetireSuspect refuses new streams on every session this client holds now, while the streams
+// already on them finish.
+//
+// # Why this is not CloseIdleConnections
+//
+// The trim may only drop resources nobody is using, so it skips a session that still carries a
+// stream (see CloseIdleConnections). But a session that predates a sleep boundary may not be handed
+// the next flow either: an open stream is not proof that the path survived the sleep, because a
+// stream can be open and silent across one (a paused response body, a flow between packets). Such a
+// session is unverified whatever its stream count says, and the stream that would prove it is the
+// next one - which is why the boundary has to happen before that stream is written, not three
+// seconds after it stalls (streamOpenTimeout).
+//
+// Draining is the only action that is neither of the two wrong ones:
+//
+//   - a session with no stream is closed here, exactly like the trim;
+//   - a session with a live stream stops being listed for reuse, keeps the stream, and closes itself
+//     when its last stream finishes (releaseSession owns that moment);
+//   - a session a dial is already opening a stream on is marked but not closed, so a demand that
+//     raced the boundary is not cut by it.
+//
+// A session created after this call is unaffected: completing a connect and handshake after the
+// boundary is itself the proof the retired sessions do not have.
+func (c *Client) RetireSuspect() {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return
+	}
+	var closing []*session
+	for held := range c.sessions {
+		held.retired = true
+		listed := held.element != nil
+		if listed {
+			c.idleSessions.Remove(held.element)
+			held.element = nil
+		}
+		if listed && !held.hasStreams() {
+			delete(c.sessions, held)
+			closing = append(closing, held)
+		}
+	}
+	c.access.Unlock()
+	for _, held := range closing {
+		held.Close()
 	}
 }
 

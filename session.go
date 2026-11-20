@@ -57,6 +57,10 @@ type session struct {
 
 	idleSince time.Time
 	element   *list.Element[*session]
+	// retired marks a session the client's RetireSuspect removed from reuse while it still carried a
+	// stream. It is guarded by the client's access lock, which is also where releaseSession decides
+	// whether the session may be listed again, so a retired session can never be re-listed.
+	retired bool
 }
 
 func newClientSession(client *Client, conn net.Conn) *session {
