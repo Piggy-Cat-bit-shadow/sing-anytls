@@ -86,11 +86,57 @@ type Client struct {
 }
 
 // pendingCreation is one shared session creation and its result.
+//
+// abandoned is closed when the creation stops belonging to the pool: a network change (Reset) clears
+// c.pending so new demand starts a fresh creation on the new path, and close(abandoned) releases the
+// waiters that attached to the old one. Abandoning is not a failure of the dial: the waiters retry in
+// the new generation. done is still closed by the creator, which owns the result.
 type pendingCreation struct {
-	done    chan struct{}
+	done      chan struct{}
+	abandoned chan struct{}
+
+	abandonOnce sync.Once
+	cancelMu    sync.Mutex
+	cancel      context.CancelFunc
+
 	session *session
 	err     error
 }
+
+// abandon detaches the creation from the pool: waiters stop waiting on done, and the creation's
+// context is cancelled so a dial or handshake parked on the old path returns instead of pinning the
+// goroutine (and its waiters) until the creation timeout. Safe to call more than once, and safe to
+// call before the creator has published its cancel function.
+func (p *pendingCreation) abandon() {
+	p.abandonOnce.Do(func() {
+		close(p.abandoned)
+		p.cancelMu.Lock()
+		cancel := p.cancel
+		p.cancelMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+}
+
+// setCancel publishes the creation's cancel function and reports whether the creation was abandoned
+// before it could start. When that happens the caller must cancel immediately and must not dial: the
+// pool no longer wants this creation.
+func (p *pendingCreation) setCancel(cancel context.CancelFunc) (abandoned bool) {
+	p.cancelMu.Lock()
+	p.cancel = cancel
+	p.cancelMu.Unlock()
+	select {
+	case <-p.abandoned:
+		return true
+	default:
+		return false
+	}
+}
+
+// creationAbandoned is the error a creation reports when a network change took its pool entry away.
+// It is not a dial failure: the demand it served retries against the new generation.
+var creationAbandoned = E.New("anytls: session creation abandoned by a network change")
 
 // defaultSessionCreationTimeout bounds a shared creation whose first caller had no deadline, so a
 // peer that never completes the handshake cannot pin the creation (and its waiters) indefinitely.
@@ -187,6 +233,10 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 //   - A failed creation fails every waiter with the same error and is not retried here; the next
 //     demand starts a new one. A success whose session closed before a waiter used it gets one more
 //     attempt, because the result was discarded, not refused.
+//   - A network change takes the creation with it: Reset clears c.pending and abandons it, so new
+//     demand starts a creation on the new path instead of joining a handshake that may be parked on
+//     the old one. Waiters on the abandoned creation retry against the new generation, and a result
+//     that arrives after the abandon is closed rather than published.
 func (c *Client) sessionForCreation(ctx context.Context) (*session, error) {
 	for attempt := 0; ; attempt++ {
 		c.access.Lock()
@@ -196,21 +246,43 @@ func (c *Client) sessionForCreation(ctx context.Context) (*session, error) {
 		}
 		pending := c.pending
 		if pending == nil {
-			pending = &pendingCreation{done: make(chan struct{})}
+			pending = &pendingCreation{done: make(chan struct{}), abandoned: make(chan struct{})}
 			c.pending = pending
 			c.access.Unlock()
 
 			createCtx, cancelCreate := c.creationContext(ctx)
+			if pending.setCancel(cancelCreate) {
+				// The generation changed between registering this creation and publishing its
+				// cancel: do not dial on the old path at all.
+				cancelCreate()
+			}
 			created, err := c.createSession(createCtx)
 			cancelCreate()
 
 			c.access.Lock()
-			pending.session = created
-			pending.err = err
-			if c.pending == pending {
+			superseded := c.pending != pending
+			if !superseded {
 				c.pending = nil
 			}
 			c.access.Unlock()
+			if superseded {
+				// A network change (or Close) took the pool entry away while this dial/handshake
+				// was still running. The result belongs to the old path: never publish it, and
+				// close it so a session whose readLoop already started does not linger.
+				if created != nil {
+					c.removeSession(created)
+					created.Close()
+				}
+				pending.session = nil
+				pending.err = creationAbandoned
+				close(pending.done)
+				if attempt < 1 {
+					continue
+				}
+				return nil, creationAbandoned
+			}
+			pending.session = created
+			pending.err = err
 			close(pending.done)
 			return created, err
 		}
@@ -231,12 +303,19 @@ func (c *Client) sessionForCreation(ctx context.Context) (*session, error) {
 			} else if pending.session != nil && !pending.session.IsClosed() {
 				shared = pending.session
 			}
+		case <-pending.abandoned:
+			waitErr = creationAbandoned
 		case <-ctx.Done():
 			waitErr = ctx.Err()
 		}
 		c.pendingWaiters.Add(-1)
 		if shared != nil {
 			return shared, nil
+		}
+		if waitErr == creationAbandoned && attempt < 1 {
+			// The pool moved to a new generation under this waiter: retry there instead of
+			// reporting the abandoned creation as this demand's failure.
+			continue
 		}
 		if waitErr != nil {
 			return nil, waitErr
@@ -504,6 +583,11 @@ func (c *Client) Reset() {
 		c.access.Unlock()
 		return
 	}
+	// The in-flight creation was started for the path that just went away. Clearing c.pending is
+	// what stops new demand from joining it; abandoning it releases its waiters and cancels the
+	// dial/handshake itself, so a handshake parked on the old path cannot hold the pool hostage.
+	pending := c.pending
+	c.pending = nil
 	sessions := make([]*session, 0, len(c.sessions))
 	for closing := range c.sessions {
 		closing.element = nil
@@ -512,6 +596,9 @@ func (c *Client) Reset() {
 	clear(c.sessions)
 	c.idleSessions.Init()
 	c.access.Unlock()
+	if pending != nil {
+		pending.abandon()
+	}
 	for _, closing := range sessions {
 		closing.Close()
 	}
@@ -569,6 +656,8 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	pending := c.pending
+	c.pending = nil
 	cancelCreation := c.cancelCreation
 	if c.idleTimer != nil {
 		c.idleTimer.Stop()
@@ -582,6 +671,9 @@ func (c *Client) Close() error {
 	clear(c.sessions)
 	c.idleSessions.Init()
 	c.access.Unlock()
+	if pending != nil {
+		pending.abandon()
+	}
 	if cancelCreation != nil {
 		cancelCreation(net.ErrClosed)
 	}
